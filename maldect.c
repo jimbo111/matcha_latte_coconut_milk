@@ -7,7 +7,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
-#include <openssl/sha.h>
+#include <math.h>
+#include <openssl/evp.h>
 
 #ifdef __APPLE__
 #include <sys/xattr.h>
@@ -17,22 +18,16 @@
 #define MAX_FILE_READ (200 * 1024 * 1024)
 
 static const char *suspicious_keywords[] = {
-    "socket", "connect", "accept", "listen", "bind", "send", "recv",
-    "gethostbyname", "getaddrinfo", "http://", "https://", "ftp://",
-    "wget", "curl", "URLDownloadToFile", "InternetConnect", "InternetOpen",
-    "cmd.exe", "powershell", "pwsh", "/bin/sh", "/bin/bash", "system(", "popen(", "exec(", "execve(",
-    "CreateProcess", "CreateRemoteThread", "VirtualAlloc", "LoadLibrary", "WinExec",
-    "RegSetValue", "HKLM\\", "HKCU\\", "RunOnce",
-    "UPX!", "UPX0", "UPX1",
-    "WScript", "cscript", "wscript.exe",
-    "fopen(", "fwrite(", "fread(", "remove(", "unlink(",
-    "ssh ", "nc ", "netcat", "reverse", "bindshell", "backshell",
-    NULL
-};
-
-static const char *packers[] = {
-    "UPX!",
-    "PE-packed",
+    "socket","connect","accept","listen","bind","send","recv",
+    "gethostbyname","getaddrinfo","http://","https://","ftp://",
+    "wget","curl","URLDownloadToFile","InternetConnect","InternetOpen",
+    "cmd.exe","powershell","pwsh","/bin/sh","/bin/bash","system(","popen(","exec(","execve(",
+    "CreateProcess","CreateRemoteThread","VirtualAlloc","LoadLibrary","WinExec",
+    "RegSetValue","HKLM\\","HKCU\\","RunOnce",
+    "UPX!","UPX0","UPX1",
+    "WScript","cscript","wscript.exe",
+    "fopen(","fwrite(","fread(","remove(","unlink(",
+    "ssh ","nc ","netcat","reverse","bindshell","backshell",
     NULL
 };
 
@@ -48,7 +43,8 @@ static unsigned char *read_file(const char *path, size_t *out_size) {
     if (sz < 0) { fclose(f); return NULL; }
     if ((size_t)sz > MAX_FILE_READ) {
         fprintf(stderr, "file too large (> %d MiB)\n", MAX_FILE_READ / (1024*1024));
-        fclose(f); return NULL;
+        fclose(f);
+        return NULL;
     }
     rewind(f);
     unsigned char *buf = malloc((size_t)sz + 1);
@@ -62,10 +58,13 @@ static unsigned char *read_file(const char *path, size_t *out_size) {
 }
 
 static void compute_sha256(const unsigned char *buf, size_t n, unsigned char out[32]) {
-    SHA256_CTX ctx;
-    SHA256_Init(&ctx);
-    SHA256_Update(&ctx, buf, n);
-    SHA256_Final(out, &ctx);
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) { fprintf(stderr, "EVP_MD_CTX_new failed\n"); exit(1); }
+    if (!EVP_DigestInit_ex(ctx, EVP_sha256(), NULL)) { EVP_MD_CTX_free(ctx); fprintf(stderr, "EVP_DigestInit_ex failed\n"); exit(1); }
+    if (!EVP_DigestUpdate(ctx, buf, n)) { EVP_MD_CTX_free(ctx); fprintf(stderr, "EVP_DigestUpdate failed\n"); exit(1); }
+    unsigned int outlen = 0;
+    if (!EVP_DigestFinal_ex(ctx, out, &outlen) || outlen != 32) { EVP_MD_CTX_free(ctx); fprintf(stderr, "EVP_DigestFinal_ex failed\n"); exit(1); }
+    EVP_MD_CTX_free(ctx);
 }
 
 static double shannon_entropy(const unsigned char *buf, size_t n) {
@@ -135,7 +134,6 @@ static const char *detect_file_type(const unsigned char *buf, size_t n) {
     if (n >= 4 && buf[0] == 0x7f && buf[1] == 'E' && buf[2] == 'L' && buf[3] == 'F') return "ELF";
     if (n >= 2 && buf[0] == 'M' && buf[1] == 'Z') return "PE (Windows .exe / .dll)";
     if (n >= 4) {
-        uint32_t v = (buf[0]<<24)|(buf[1]<<16)|(buf[2]<<8)|buf[3];
         if ((buf[0]==0xfe && buf[1]==0xed && buf[2]==0xfa && (buf[3]==0xce || buf[3]==0xcf)) ||
             (buf[0]==0xcf && buf[1]==0xfa && buf[2]==0xed && (buf[3]==0xfe || buf[3]==0xce))) return "Mach-O";
     }
@@ -216,27 +214,19 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to read file '%s': %s\n", path, strerror(errno));
         return 3;
     }
-
     unsigned char digest[32];
     compute_sha256(buf, fsize, digest);
-
     const char *ftype = detect_file_type(buf, fsize);
-
     double entropy = shannon_entropy(buf, fsize);
-
     size_t s_count = 0;
     char **strings = extract_strings(buf, fsize, &s_count);
-
     size_t suspicious_hits = 0, url_hits = 0, keyword_hits = 0;
     int upx = 0;
     scan_for_indicators(buf, fsize, strings, s_count, &suspicious_hits, &url_hits, &upx, &keyword_hits);
-
     int exec_mode = is_executable_mode(path);
     char qval[512] = {0};
     int has_quar = has_quarantine_xattr(path, qval, sizeof(qval));
-
     double risk = score_risk(ftype, entropy, keyword_hits, upx, exec_mode, url_hits);
-
     printf("=== maldet report ===\n");
     printf("File: %s\n", path);
     printf("Size: %zu bytes\n", fsize);
@@ -263,7 +253,6 @@ int main(int argc, char **argv) {
         if (show) { printf("  - %s\n", strings[i]); shown++; }
     }
     if (shown == 0) printf("  (none matched suspicious list)\n");
-
     printf("\nHeuristic risk score: %.2f (higher = more suspicious)\n", risk);
     if (risk >= 6.0) {
         printf("=> HIGH suspicion: consider sandboxing, YARA, VirusTotal, or professional analysis.\n");
@@ -272,13 +261,8 @@ int main(int argc, char **argv) {
     } else {
         printf("=> LOW suspicion: likely benign but not guaranteed.\n");
     }
-
     free_strings(strings, s_count);
     free(buf);
     return 0;
 }
-~                                                                                                                                                                                     
-~                                                                                                                                                                                     
-~                                                                                                                                                                                     
-~                                                                                                                                                                                     
-~                              
+
